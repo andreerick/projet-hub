@@ -1,0 +1,5 @@
+TEST PROJECT HUB
+Origine : ChatGPT
+Destination : Project Hub puis GitHub
+Date : 1 août 2026
+Résultat attendu : ce fichier doit apparaître dans le dépôt GitHub de test.
