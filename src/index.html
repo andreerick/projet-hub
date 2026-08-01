@@ -724,6 +724,98 @@
     return 'autres';
   }
 
+  function splitConflictName(filename) {
+    const lastDot = filename.lastIndexOf('.');
+    if (lastDot <= 0) return { stem: filename, ext: '' };
+    return { stem: filename.slice(0, lastDot), ext: filename.slice(lastDot) };
+  }
+
+  function splitPath(path) {
+    const parts = path.split('/').filter(Boolean);
+    const fileName = parts.pop() || '';
+    return {
+      parts,
+      fileName
+    };
+  }
+
+  async function fileExistsInDirectory(dirHandle, fileName) {
+    try {
+      await dirHandle.getFileHandle(fileName);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  async function getNextAvailableFileName(dirHandle, fileName, reservedNames = new Set()) {
+    if (!fileName) return fileName;
+    if (!reservedNames.has(fileName) && !(await fileExistsInDirectory(dirHandle, fileName))) {
+      return fileName;
+    }
+    const { stem, ext } = splitConflictName(fileName);
+    let index = 1;
+    while (true) {
+      const candidate = `${stem}${index}${ext}`;
+      if (reservedNames.has(candidate)) {
+        index++;
+        continue;
+      }
+      if (!(await fileExistsInDirectory(dirHandle, candidate))) {
+        return candidate;
+      }
+      index++;
+    }
+  }
+
+  async function writeFileToDirectory(dirHandle, fileName, content) {
+    const targetFileName = await getNextAvailableFileName(dirHandle, fileName);
+    const fileHandle = await dirHandle.getFileHandle(targetFileName, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(content);
+    await writable.close();
+    return targetFileName;
+  }
+
+  async function getDirectoryForPath(rootHandle, parts, create = false) {
+    let dir = rootHandle;
+    for (const part of parts) {
+      dir = create
+        ? await dir.getDirectoryHandle(part, { create: true })
+        : await dir.getDirectoryHandle(part);
+    }
+    return dir;
+  }
+
+  async function resolveIncomingPath(rootHandle, path, options = {}) {
+    const { createDirectories = false, reservations = null } = options;
+    const { parts, fileName } = splitPath(path);
+    if (!fileName) return path;
+    try {
+      const dir = await getDirectoryForPath(rootHandle, parts, createDirectories);
+      const reservationKey = parts.join('/');
+      let reservedNames = reservations ? reservations.get(reservationKey) : null;
+      if (!reservedNames) {
+        reservedNames = new Set();
+        if (reservations) reservations.set(reservationKey, reservedNames);
+      }
+      const targetFileName = await getNextAvailableFileName(dir, fileName, reservedNames);
+      reservedNames.add(targetFileName);
+      return [...parts, targetFileName].join('/');
+    } catch (e) {
+      return path;
+    }
+  }
+
+  async function planIncomingPaths(rootHandle, paths, createDirectories = false) {
+    const reservations = new Map();
+    const plannedPaths = [];
+    for (const path of paths) {
+      plannedPaths.push(await resolveIncomingPath(rootHandle, path, { createDirectories, reservations }));
+    }
+    return plannedPaths;
+  }
+
   /* Drag & drop */
   const dropzone = document.getElementById('dropzone');
   ['dragenter', 'dragover'].forEach(evt => {
@@ -738,14 +830,16 @@
     const files = Array.from(e.dataTransfer.files || []);
     if (!files.length) return;
     let count = 0;
+    let renamedCount = 0;
     for (const file of files) {
       const folder = classify(file.name);
       try {
         const folderHandle = await p.dirHandle.getDirectoryHandle(folder, { create: true });
-        const fileHandle = await folderHandle.getFileHandle(file.name, { create: true });
-        const writable = await fileHandle.createWritable();
-        await writable.write(file);
-        await writable.close();
+        const savedName = await writeFileToDirectory(folderHandle, file.name, file);
+        if (savedName !== file.name) {
+          renamedCount++;
+          await log(p.name, `Conflit détecté : "${file.name}" a été importé sous "${savedName}" pour préserver le fichier local existant.`);
+        }
         count++;
       } catch (err) {
         await log(p.name, `Échec de l'import de "${file.name}" : ${err.message}`);
@@ -754,7 +848,7 @@
     if (count) {
       p.lastActivity = Date.now();
       await idbPut('projects', p);
-      await log(p.name, `${count} fichier(s) importé(s) et rangé(s) automatiquement.`);
+      await log(p.name, `${count} fichier(s) importé(s) et rangé(s) automatiquement${renamedCount ? `, dont ${renamedCount} renommé(s) pour éviter l’écrasement.` : '.'}`);
     }
     await refreshFileList();
   });
@@ -886,19 +980,6 @@
   });
 
   /* ============ Safe Pull with preview and file selection ============ */
-  async function localFileExists(rootHandle, path) {
-    const parts = path.split('/');
-    const fileName = parts.pop();
-    let dir = rootHandle;
-    try {
-      for (const part of parts) dir = await dir.getDirectoryHandle(part);
-      await dir.getFileHandle(fileName);
-      return true;
-    } catch (e) {
-      return false;
-    }
-  }
-
   function showPullPreview(items) {
     return new Promise(resolve => {
       const old = document.getElementById('pull-preview-backdrop');
@@ -914,7 +995,7 @@
           <span style="flex:1;min-width:0;">
             <span style="font-family:var(--font-mono);font-size:11.5px;word-break:break-all;">${escapeHtml(item.path)}</span>
             <span style="display:block;font-size:10.5px;margin-top:2px;color:${item.exists ? 'var(--brass-bright)' : 'var(--ok)'};">
-              ${item.exists ? '⚠ existe déjà localement — sera remplacé' : 'nouveau fichier'}
+              ${item.exists ? `⚠ existe déjà localement — sera enregistré sous ${escapeHtml(item.targetPath)}` : 'nouveau fichier'}
             </span>
           </span>
         </label>`).join('');
@@ -923,7 +1004,7 @@
         <div class="modal" style="width:650px;max-width:94vw;max-height:86vh;display:flex;flex-direction:column;">
           <h2>Aperçu du Pull GitHub</h2>
           <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">
-            Choisis uniquement les fichiers à récupérer. Les fichiers déjà présents localement sont signalés avant tout écrasement.
+            Choisis uniquement les fichiers à récupérer. En cas de conflit, le fichier entrant sera renommé automatiquement pour préserver la copie locale.
           </div>
           <div style="display:flex;gap:8px;margin-bottom:10px;">
             <button class="btn secondary" id="pull-select-all">Tout sélectionner</button>
@@ -966,13 +1047,12 @@
       const treeData = await ghApi(`${base}/git/trees/${commitData.tree.sha}?recursive=1`);
       const blobs = treeData.tree.filter(item => item.type === 'blob');
 
-      const preview = [];
-      for (const item of blobs) {
-        preview.push({
-          ...item,
-          exists: await localFileExists(p.dirHandle, item.path)
-        });
-      }
+      const previewPaths = await planIncomingPaths(p.dirHandle, blobs.map(item => item.path));
+      const preview = blobs.map((item, index) => ({
+        ...item,
+        targetPath: previewPaths[index],
+        exists: previewPaths[index] !== item.path
+      }));
 
       setGhStatus('', '');
       const selected = await showPullPreview(preview);
@@ -987,19 +1067,24 @@
       }
 
       setGhStatus('pending', `Récupération de ${selected.length} fichier(s)…`);
+      const selectedPaths = await planIncomingPaths(p.dirHandle, selected.map(item => item.path), true);
       let count = 0;
-      for (const item of selected) {
+      let renamedCount = 0;
+      for (let index = 0; index < selected.length; index++) {
+        const item = selected[index];
+        const targetPath = selectedPaths[index];
         const blobData = await ghApi(`${base}/git/blobs/${item.sha}`);
         const buffer = base64ToArrayBuffer(blobData.content.replace(/\n/g, ''));
-        await writeFileAtPath(p.dirHandle, item.path, buffer);
+        const savedPath = await writeFileAtPath(p.dirHandle, targetPath, buffer);
+        if (savedPath !== item.path) renamedCount++;
         count++;
       }
 
       p.lastActivity = Date.now();
       await idbPut('projects', p);
       renderDashboard();
-      setGhStatus('ok', `Récupéré : ${count} fichier(s) sélectionné(s).`);
-      await log(p.name, `Pull sécurisé réussi (${count} fichier(s)) depuis ${owner}/${repo}.`);
+      setGhStatus('ok', `Récupéré : ${count} fichier(s) sélectionné(s)${renamedCount ? `, dont ${renamedCount} renommé(s) pour éviter l’écrasement.` : '.'}`);
+      await log(p.name, `Pull sécurisé réussi (${count} fichier(s) depuis ${owner}/${repo})${renamedCount ? `, dont ${renamedCount} renommé(s) pour préserver les fichiers locaux.` : '.'}`);
       await refreshFileList();
     } catch (e) {
       setGhStatus('err', 'Échec de la récupération : ' + e.message);
@@ -1008,16 +1093,10 @@
   });
 
   async function writeFileAtPath(rootHandle, path, arrayBuffer) {
-    const parts = path.split('/');
-    const fileName = parts.pop();
-    let dir = rootHandle;
-    for (const part of parts) {
-      dir = await dir.getDirectoryHandle(part, { create: true });
-    }
-    const fileHandle = await dir.getFileHandle(fileName, { create: true });
-    const writable = await fileHandle.createWritable();
-    await writable.write(arrayBuffer);
-    await writable.close();
+    const { parts, fileName } = splitPath(path);
+    const dir = await getDirectoryForPath(rootHandle, parts, true);
+    const savedName = await writeFileToDirectory(dir, fileName, arrayBuffer);
+    return [...parts, savedName].join('/');
   }
 
   /* ============ Journal ============ */
