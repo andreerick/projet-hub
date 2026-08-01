@@ -1,0 +1,8 @@
+TEST PROJECT HUB — v0.4
+
+Ce fichier sert uniquement à tester le routage automatique de Project Hub v0.4.
+
+Destination attendue :
+projet-hub / documents / test-v04.txt
+
+Si ce fichier arrive dans documents/test-v04.txt, le test est réussi.
